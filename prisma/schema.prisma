@@ -1,0 +1,131 @@
+// Calliser — sales call management platform.
+// Backed by PostgreSQL (Supabase). Connection URLs come from .env.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Pooled connection (Supabase transaction-mode pooler, pgbouncer).
+  url       = env("DATABASE_URL")
+  // Direct connection (session-mode pooler) used for migrations / db push.
+  directUrl = env("DIRECT_URL")
+}
+
+// An organization / company tenant. Every user, device and call belongs to one.
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  users   User[]
+  devices Device[]
+  calls   Call[]
+}
+
+// Roles are stored as plain strings (validated in app code, see
+// src/lib/constants.ts). Allowed values: "ADMIN" | "AGENT".
+model User {
+  id           String   @id @default(cuid())
+  orgId        String
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         String   @default("AGENT")
+  phoneNumber  String? // the business line assigned to this sales agent
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  org     Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  devices Device[]
+  calls   Call[]
+
+  @@index([orgId])
+}
+
+// A phone (or VoIP line) that uploads call logs/recordings for an agent.
+// `tokenHash` is a SHA-256 of the ingest token; the plaintext token is only
+// ever held by the device.
+model Device {
+  id                String    @id @default(cuid())
+  orgId             String
+  userId            String?
+  label             String
+  phoneNumber       String?
+  platform          String    @default("android") // "android" | "ios" | "voip"
+  appVersion        String?
+  tokenHash         String    @unique
+  consentAcceptedAt DateTime?
+  lastSeenAt        DateTime?
+  createdAt         DateTime  @default(now())
+
+  org   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user  User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  calls Call[]
+
+  @@index([orgId])
+}
+
+// A single call record.
+// direction: "INBOUND" | "OUTBOUND" | "MISSED"
+// status:    "RECEIVED" | "TRANSCRIBING" | "COMPLETED" | "FAILED"
+model Call {
+  id          String   @id @default(cuid())
+  orgId       String
+  userId      String?
+  deviceId    String?
+  externalId  String? // device-provided id for idempotent ingest
+  direction   String   @default("OUTBOUND")
+  fromNumber  String
+  toNumber    String
+  contactName String?
+  startedAt   DateTime
+  durationSec Int      @default(0)
+  status      String   @default("RECEIVED")
+
+  recordingPath String? // "local:<path>" or "supabase:<path>"
+  recordingMime String?
+  recordingSize Int?
+
+  // AI-derived insights
+  summary     String?
+  sentiment   String? // "positive" | "neutral" | "negative"
+  keywords    String? // comma-separated
+  actionItems String? // JSON array of strings
+  aiError     String? // last AI processing problem, shown to admins
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org        Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user       User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  device     Device?      @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  transcript Transcript?
+
+  @@unique([deviceId, externalId])
+  @@index([orgId, startedAt])
+  @@index([userId])
+}
+
+// status: "PENDING" | "DONE" | "FAILED" | "SKIPPED"
+model Transcript {
+  id        String   @id @default(cuid())
+  callId    String   @unique
+  text      String   @default("")
+  language  String?
+  provider  String?
+  status    String   @default("PENDING")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+}
+
+// Fixed-window counters for brute-force protection (login, app sign-in).
+// Stored in the database so limits hold across multiple server instances.
+model RateLimit {
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
+}
