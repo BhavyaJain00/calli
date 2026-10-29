@@ -10,6 +10,9 @@ import java.net.URL
 /** An HTTP error returned by the Calliser server. */
 class ApiException(val status: Int, message: String) : IOException(message)
 
+/** An error from the storage service while uploading a recording file. */
+class StorageUploadException(val status: Int, message: String) : IOException(message)
+
 /** Minimal client for the Calliser server API (no third-party HTTP library). */
 object Api {
     private const val CONNECT_TIMEOUT_MS = 20_000
@@ -22,29 +25,74 @@ object Api {
         return url
     }
 
-    fun register(server: String, body: JSONObject): JSONObject {
-        val conn = open("$server/api/mobile/register", "POST", token = null)
-        conn.doOutput = true
-        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+    fun register(server: String, body: JSONObject): JSONObject =
+        postJson("$server/api/mobile/register", null, body)
+
+    /**
+     * Validates the token, marks this phone as online, reports the recording
+     * check, and returns how the server wants recordings uploaded.
+     */
+    fun heartbeat(server: String, token: String, check: RecordingCheck?): JSONObject {
+        val conn = open("$server/api/mobile/me", "GET", token)
+        if (check != null) {
+            check.serverLabel?.let { conn.setRequestProperty("X-Dialer-App", it.take(120)) }
+            conn.setRequestProperty("X-Recordings-Visible", check.recordingsFound.toString())
+        }
         return readResponse(conn)
     }
-
-    /** Validates the token and marks this phone as online on the dashboard. */
-    fun heartbeat(server: String, token: String): JSONObject =
-        readResponse(open("$server/api/mobile/me", "GET", token))
 
     /** Revokes this phone's token on the server (used on sign-out). */
     fun revoke(server: String, token: String) {
         readResponse(open("$server/api/mobile/me", "DELETE", token))
     }
 
-    /** Uploads one call, streaming its recording when there is one. */
-    fun ingest(
+    /** Sends call details (and optionally a `recordingKey` for audio uploaded directly). */
+    fun ingestJson(server: String, token: String, meta: JSONObject): JSONObject =
+        postJson("$server/api/ingest", token, meta)
+
+    /** Asks the server for a signed URL to upload one recording straight to storage. */
+    fun requestUpload(server: String, token: String, mime: String, sizeBytes: Long): JSONObject =
+        postJson(
+            "$server/api/mobile/upload-url",
+            token,
+            JSONObject().put("mime", mime).put("sizeBytes", sizeBytes),
+        )
+
+    /** Uploads a recording to a signed storage URL with the headers the server provided. */
+    fun putFile(uploadUrl: String, headers: JSONObject, recording: RecordingFile, resolver: ContentResolver) {
+        val conn = URL(uploadUrl).openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = "PUT"
+            conn.connectTimeout = CONNECT_TIMEOUT_MS
+            conn.readTimeout = READ_TIMEOUT_MS
+            conn.doOutput = true
+            for (key in headers.keys()) conn.setRequestProperty(key, headers.getString(key))
+            if (recording.sizeBytes > 0) {
+                conn.setFixedLengthStreamingMode(recording.sizeBytes)
+            } else {
+                conn.setChunkedStreamingMode(64 * 1024)
+            }
+            val input = resolver.openInputStream(recording.uri)
+                ?: throw IOException("The recording file could not be opened")
+            input.use { inp -> conn.outputStream.use { out -> inp.copyTo(out, 64 * 1024) } }
+
+            val status = conn.responseCode
+            if (status !in 200..299) {
+                val body = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                val message = runCatching { JSONObject(body).str("message") ?: JSONObject(body).str("error") }.getOrNull()
+                throw StorageUploadException(status, "Recording upload failed ($status)${message?.let { ": $it" } ?: ""}")
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** Uploads call details and the recording in one multipart request. */
+    fun ingestMultipart(
         server: String,
         token: String,
         meta: JSONObject,
-        recording: RecordingFile?,
+        recording: RecordingFile,
         resolver: ContentResolver,
     ): JSONObject {
         val boundary = "----CalliserBoundary${System.nanoTime()}"
@@ -60,17 +108,22 @@ object Api {
             write(meta.toString())
             write("\r\n")
 
-            if (recording != null) {
-                val input = resolver.openInputStream(recording.uri)
-                    ?: throw IOException("The recording file could not be opened")
-                write("--$boundary\r\n")
-                write("Content-Disposition: form-data; name=\"recording\"; filename=\"recording.${recording.extension}\"\r\n")
-                write("Content-Type: ${recording.mime}\r\n\r\n")
-                input.use { it.copyTo(out, 64 * 1024) }
-                write("\r\n")
-            }
-            write("--$boundary--\r\n")
+            val input = resolver.openInputStream(recording.uri)
+                ?: throw IOException("The recording file could not be opened")
+            write("--$boundary\r\n")
+            write("Content-Disposition: form-data; name=\"recording\"; filename=\"recording.${recording.extension}\"\r\n")
+            write("Content-Type: ${recording.mime}\r\n\r\n")
+            input.use { it.copyTo(out, 64 * 1024) }
+            write("\r\n--$boundary--\r\n")
         }
+        return readResponse(conn)
+    }
+
+    private fun postJson(url: String, token: String?, body: JSONObject): JSONObject {
+        val conn = open(url, "POST", token)
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
         return readResponse(conn)
     }
 

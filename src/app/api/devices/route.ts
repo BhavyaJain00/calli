@@ -16,6 +16,8 @@ export async function GET() {
       phoneNumber: true,
       platform: true,
       appVersion: true,
+      dialerApp: true,
+      recordingsVisible: true,
       consentAcceptedAt: true,
       lastSeenAt: true,
       createdAt: true,

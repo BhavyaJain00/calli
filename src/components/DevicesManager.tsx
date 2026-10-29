@@ -10,6 +10,8 @@ type DeviceRow = {
   phoneNumber: string | null;
   platform: string;
   appVersion: string | null;
+  dialerApp: string | null;
+  recordingsVisible: number | null;
   consentAcceptedAt: string | null;
   lastSeenAt: string | null;
   createdAt: string;
@@ -164,7 +166,7 @@ export function DevicesManager({ agents }: { agents: AgentOption[] }) {
               <tr>
                 <th className="px-4 py-2.5 font-medium">Device</th>
                 <th className="px-4 py-2.5 font-medium">Agent</th>
-                <th className="px-4 py-2.5 font-medium">Consent</th>
+                <th className="px-4 py-2.5 font-medium">Recordings</th>
                 <th className="px-4 py-2.5 font-medium">Last seen</th>
                 <th className="px-4 py-2.5 font-medium">Calls</th>
                 <th className="px-4 py-2.5 font-medium"></th>
@@ -189,17 +191,16 @@ export function DevicesManager({ agents }: { agents: AgentOption[] }) {
                       {d.platform}
                       {d.appVersion ? ` · app ${d.appVersion}` : ""}
                       {d.phoneNumber ? ` · ${d.phoneNumber}` : ""}
+                      {!d.consentAcceptedAt && (
+                        <span className="text-amber-600"> · consent pending</span>
+                      )}
                     </div>
                   </td>
                   <td className="px-4 py-3 text-slate-600">
                     {d.user?.name ?? "—"}
                   </td>
                   <td className="px-4 py-3">
-                    {d.consentAcceptedAt ? (
-                      <Badge value="positive" />
-                    ) : (
-                      <span className="text-xs text-amber-600">pending</span>
-                    )}
+                    <RecordingCheck device={d} />
                   </td>
                   <td className="px-4 py-3 text-slate-600">
                     {d.lastSeenAt ? relativeTime(d.lastSeenAt) : "never"}
@@ -219,6 +220,38 @@ export function DevicesManager({ agents }: { agents: AgentOption[] }) {
           </table>
         </div>
       </Card>
+    </div>
+  );
+}
+
+// Result of the phone's recording check: can Calliser read the call
+// recordings made by this phone's dialer?
+function RecordingCheck({ device }: { device: DeviceRow }) {
+  if (device.platform !== "android") return <span className="text-slate-400">—</span>;
+  if (device.recordingsVisible === null) {
+    return <span className="text-xs text-slate-400">Update the app to check</span>;
+  }
+  const googleDialer = /com\.google\.android\.dialer/.test(device.dialerApp ?? "");
+  const found = device.recordingsVisible > 0;
+  return (
+    <div>
+      <span
+        className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${
+          found ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
+        }`}
+      >
+        {found ? `${device.recordingsVisible} found` : "none found"}
+      </span>
+      {device.dialerApp && (
+        <div className="mt-1 max-w-48 truncate text-xs text-slate-400" title={device.dialerApp}>
+          {device.dialerApp.replace(/\s*\(.*\)$/, "")}
+        </div>
+      )}
+      {!found && googleDialer && (
+        <div className="mt-1 max-w-48 text-xs text-amber-700">
+          Google Phone keeps recordings private; only call details sync.
+        </div>
+      )}
     </div>
   );
 }

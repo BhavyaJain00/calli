@@ -55,6 +55,10 @@ model Device {
   phoneNumber       String?
   platform          String    @default("android") // "android" | "ios" | "voip"
   appVersion        String?
+  // Reported by the app's recording check: the phone's default dialer app and
+  // how many call recordings it can see in the last 30 days.
+  dialerApp         String?
+  recordingsVisible Int?
   tokenHash         String    @unique
   consentAcceptedAt DateTime?
   lastSeenAt        DateTime?

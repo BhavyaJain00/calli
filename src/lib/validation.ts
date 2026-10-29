@@ -68,4 +68,12 @@ export const ingestSchema = z.object({
   startedAt: z.string().min(1),
   durationSec: z.coerce.number().int().min(0).max(60 * 60 * 24).default(0),
   consent: z.boolean().optional(),
+  // Set when the phone already uploaded the audio straight to storage.
+  recordingKey: z.string().max(300).optional(),
+  recordingMime: z.string().max(100).optional(),
+});
+
+export const uploadUrlSchema = z.object({
+  mime: z.string().min(1).max(100),
+  sizeBytes: z.coerce.number().int().min(1),
 });

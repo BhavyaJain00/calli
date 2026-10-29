@@ -145,8 +145,10 @@ export function CallDetail({ callId, isAdmin }: { callId: string; isAdmin: boole
             ) : (
               <p className="text-sm text-slate-400">
                 {call.direction === "MISSED"
-                  ? "Missed call — nothing was recorded."
-                  : "No recording was uploaded for this call. Check that automatic call recording is turned on in the phone's dialer."}
+                  ? "Missed call, so nothing was recorded."
+                  : call.durationSec === 0
+                    ? "The call wasn't answered, so there is no recording."
+                    : "No recording has been uploaded for this call yet. Open the Calliser app on the phone and look at “Recording check” to see whether the phone's call recordings can be read."}
               </p>
             )}
           </Card>

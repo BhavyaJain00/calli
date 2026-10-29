@@ -40,6 +40,8 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var prefillServer: String? = null
     private var prefillEmail: String? = null
+    private var check: RecordingCheck? = null
+    private var checkRunning = false
 
     // Refreshes the status screen while it's visible (sync runs in the background).
     private val ticker = object : Runnable {
@@ -80,6 +82,7 @@ class MainActivity : Activity() {
         if (prefs.isSignedIn && Permissions.hasRequired(this)) {
             SyncScheduler.schedulePeriodic(this)
             SyncScheduler.syncSoon(this)
+            runRecordingCheck()
         }
         handler.postDelayed(ticker, 3_000)
     }
@@ -96,7 +99,23 @@ class MainActivity : Activity() {
         if (prefs.isSignedIn && Permissions.hasRequired(this)) {
             SyncScheduler.schedulePeriodic(this)
             SyncScheduler.syncSoon(this)
+            runRecordingCheck()
         }
+    }
+
+    /** Looks for the phone's call recordings in the background, then redraws. */
+    private fun runRecordingCheck() {
+        if (checkRunning) return
+        checkRunning = true
+        Thread {
+            val result = runCatching { Diagnostics.run(this) }.getOrNull()
+            runOnUiThread {
+                checkRunning = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                check = result
+                render()
+            }
+        }.start()
     }
 
     private fun readDeepLink(intent: Intent?) {
@@ -270,21 +289,14 @@ class MainActivity : Activity() {
         sync.addView(row("Calls uploaded", prefs.uploadedCount.toString()))
         prefs.lastError?.let { sync.addView(text(it, 13f, ERROR)) }
 
-        if (!Permissions.granted(this, Permissions.audio)) {
-            addBanner(
-                "Recordings won't be uploaded until you allow access to music and audio files.",
-                isError = false,
-            )
-            addButton("Allow audio access") {
-                requestPermissions(arrayOf(Permissions.audio), REQUEST_PERMISSIONS)
-            }
-        }
+        renderRecordingCheck()
 
         addButton("Sync now", primary = true) {
             SyncScheduler.syncSoon(this)
             prefs.lastError = null
             render()
         }
+        addButton("Upload earlier calls") { askUploadEarlierCalls() }
         addButton("Open dashboard") {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("${prefs.serverUrl}/dashboard")))
         }
@@ -308,6 +320,78 @@ class MainActivity : Activity() {
                 .setPositiveButton("Sign out") { _, _ -> signOut() }
                 .show()
         }
+    }
+
+    private fun renderRecordingCheck() {
+        val box = card()
+        box.addView(text("Recording check", 16f, TEXT, bold = true))
+        val result = check
+        if (result == null) {
+            box.addView(text("Looking for your call recordings…", 14f, MUTED))
+        } else {
+            box.addView(row("Phone app", result.displayName))
+            box.addView(
+                row(
+                    "Call recordings found",
+                    if (result.audioPermission) "${result.recordingsFound} (last 30 days)" else "No access",
+                ),
+            )
+            val (message, color) = when {
+                !result.audioPermission ->
+                    "Allow access to music and audio so Calliser can find your call recordings." to WARNING_TEXT
+                result.recordingsFound > 0 ->
+                    "Recordings are uploaded with your calls." +
+                        (result.folder?.let { " Folder: $it" } ?: "") to SUCCESS
+                result.usesGooglePhone ->
+                    "Google Phone saves call recordings inside its own app, where other apps " +
+                        "can't read them. Call details still sync. If your phone lets you choose " +
+                        "another Phone app that saves recordings to storage, make it the default." to WARNING_TEXT
+                else ->
+                    "No call recordings found. Turn on automatic call recording in your Phone " +
+                        "app (Settings → Call recording), make a short test call that is answered, " +
+                        "then tap Check again." to WARNING_TEXT
+            }
+            box.addView(text(message, 14f, color).apply { setPadding(0, dp(8), 0, 0) })
+        }
+
+        if (result?.audioPermission == false) {
+            addButton("Allow audio access") {
+                requestPermissions(arrayOf(Permissions.audio), REQUEST_PERMISSIONS)
+            }
+        }
+        addButton("Check again") {
+            check = null
+            render()
+            runRecordingCheck()
+        }
+    }
+
+    /** Re-sends calls from before sign-in, with any recordings still on the phone. */
+    private fun askUploadEarlierCalls() {
+        val days = intArrayOf(7, 30)
+        AlertDialog.Builder(this)
+            .setTitle("Upload earlier calls")
+            .setItems(arrayOf("Calls from the last 7 days", "Calls from the last 30 days")) { _, which ->
+                val n = days[which]
+                AlertDialog.Builder(this)
+                    .setTitle("Upload the last $n days?")
+                    .setMessage(
+                        "Your calls from the last $n days, and their recordings still on this " +
+                            "phone, will be uploaded to ${prefs.orgName.ifBlank { "your company" }}. " +
+                            "Only continue if the people on those calls were told that calls may be recorded.",
+                    )
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Upload") { _, _ ->
+                        val since = System.currentTimeMillis() - n * 24L * 60 * 60 * 1000
+                        if (since < prefs.lastCallDate) prefs.lastCallDate = since
+                        prefs.lastError = null
+                        SyncScheduler.syncSoon(this)
+                        render()
+                    }
+                    .show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun signOut() {

@@ -2,7 +2,12 @@ import { after } from "next/server";
 import { prisma } from "@/lib/db";
 import { apiError, json } from "@/lib/api";
 import { ingestSchema } from "@/lib/validation";
-import { isAudioMime, saveRecording } from "@/lib/storage";
+import {
+  directUploadSize,
+  isAudioMime,
+  normalizeMime,
+  saveRecording,
+} from "@/lib/storage";
 import { processCall } from "@/lib/pipeline";
 import { deviceFromRequest } from "@/lib/device-auth";
 import { MAX_UPLOAD_BYTES } from "@/lib/env";
@@ -13,10 +18,13 @@ export const maxDuration = 300;
 
 // Upload endpoint for the companion app (and VoIP integrations).
 //   Authorization: Bearer <device token>
-// Body is either:
+// Body is one of:
+//   - application/json: call metadata, optionally with `recordingKey` for audio
+//     the phone already uploaded via /api/mobile/upload-url
 //   - multipart/form-data: `meta` (JSON) + optional `recording` (audio file)
-//   - application/json: metadata only
-// Re-sending the same `externalId` from the same device is idempotent.
+// Calls are keyed by the device's `externalId`, so the app can first send the
+// call details and attach the recording in a later request. Re-sending is safe.
+// Response: { callId, hasRecording, duplicate? }
 export async function POST(req: Request) {
   const device = await deviceFromRequest(req);
   if (!device) return apiError("Invalid or revoked device token", 401);
@@ -30,7 +38,7 @@ export async function POST(req: Request) {
   }
 
   let metaRaw: unknown = null;
-  let recording: { buffer: Buffer; mime: string } | null = null;
+  let file: { buffer: Buffer; mime: string } | null = null;
 
   const contentType = req.headers.get("content-type") || "";
   if (contentType.includes("multipart/form-data")) {
@@ -43,16 +51,14 @@ export async function POST(req: Request) {
     const metaField = form.get("meta");
     metaRaw = typeof metaField === "string" ? safeJson(metaField) : null;
 
-    const file = form.get("recording");
-    if (file instanceof File && file.size > 0) {
-      if (file.size > MAX_UPLOAD_BYTES) {
+    const upload = form.get("recording");
+    if (upload instanceof File && upload.size > 0) {
+      if (upload.size > MAX_UPLOAD_BYTES) {
         return apiError("Recording is larger than the server limit", 413);
       }
-      const mime = (file.type || "audio/mpeg").toLowerCase();
-      if (!isAudioMime(mime)) {
-        return apiError(`Unsupported recording type: ${mime}`, 415);
-      }
-      recording = { buffer: Buffer.from(await file.arrayBuffer()), mime };
+      const mime = normalizeMime(upload.type);
+      if (!isAudioMime(mime)) return apiError(`Unsupported recording type: ${mime}`, 415);
+      file = { buffer: Buffer.from(await upload.arrayBuffer()), mime };
     }
   } else {
     metaRaw = await req.json().catch(() => null);
@@ -71,9 +77,11 @@ export async function POST(req: Request) {
     return apiError("startedAt must be a valid ISO date", 400);
   }
 
+  const hasIncomingRecording = Boolean(file || meta.recordingKey);
+
   // A recording is only accepted once the device has confirmed that call
   // participants are informed (done at app sign-in), per law and policy.
-  if (recording && !meta.consent && !device.consentAcceptedAt) {
+  if (hasIncomingRecording && !meta.consent && !device.consentAcceptedAt) {
     return apiError("Recording consent has not been confirmed for this device", 403);
   }
   if (meta.consent && !device.consentAcceptedAt) {
@@ -83,64 +91,97 @@ export async function POST(req: Request) {
     });
   }
 
-  // Skip the upload work if this exact call already has its recording.
-  if (meta.externalId) {
-    const existing = await prisma.call.findUnique({
-      where: { deviceId_externalId: { deviceId: device.id, externalId: meta.externalId } },
-      select: { id: true, recordingPath: true },
+  const existing = meta.externalId
+    ? await prisma.call.findUnique({
+        where: { deviceId_externalId: { deviceId: device.id, externalId: meta.externalId } },
+        select: { id: true, recordingPath: true },
+      })
+    : null;
+
+  // Nothing new to add to a call we already have.
+  if (existing && (existing.recordingPath || !hasIncomingRecording)) {
+    await touchDevice(device.id);
+    return json({
+      ok: true,
+      callId: existing.id,
+      hasRecording: Boolean(existing.recordingPath),
+      duplicate: true,
     });
-    if (existing && (existing.recordingPath || !recording)) {
-      await touchDevice(device.id);
-      return json({ ok: true, callId: existing.id, duplicate: true });
-    }
   }
 
-  let recordingFields = {};
-  if (recording) {
-    let recordingPath: string;
+  // Resolve where the recording lives.
+  let recordingFields: { recordingPath: string; recordingMime: string; recordingSize: number | null } | null =
+    null;
+  if (file) {
     try {
-      recordingPath = await saveRecording(recording.buffer, recording.mime);
+      recordingFields = {
+        recordingPath: await saveRecording(file.buffer, file.mime),
+        recordingMime: file.mime,
+        recordingSize: file.buffer.length,
+      };
     } catch (err) {
       console.error("[ingest] could not store recording:", err);
       // 503 tells the phone to retry later instead of dropping the recording.
       return apiError(err instanceof Error ? err.message : "Recording storage failed", 503);
     }
-    recordingFields = {
-      recordingPath,
-      recordingMime: recording.mime,
-      recordingSize: recording.buffer.length,
-    };
+  } else if (meta.recordingKey) {
+    const key = meta.recordingKey;
+    // Keys are issued per device by /api/mobile/upload-url.
+    if (!key.startsWith(`devices/${device.id}/`) || key.includes("..")) {
+      return apiError("Invalid recording key", 400);
+    }
+    const mime = normalizeMime(meta.recordingMime);
+    if (!isAudioMime(mime)) return apiError(`Unsupported recording type: ${mime}`, 415);
+    let size: number | null;
+    try {
+      size = await directUploadSize(key);
+    } catch (err) {
+      console.error("[ingest] could not verify upload:", err);
+      return apiError("Recording storage is temporarily unavailable", 503);
+    }
+    if (size === null) return apiError("The uploaded recording was not found", 400);
+    recordingFields = { recordingPath: `supabase:${key}`, recordingMime: mime, recordingSize: size || null };
   }
 
-  const baseData = {
-    orgId: device.orgId,
-    userId: device.userId,
-    deviceId: device.id,
-    direction: meta.direction,
-    fromNumber: meta.fromNumber,
-    toNumber: meta.toNumber,
-    contactName: meta.contactName || null,
-    startedAt,
-    durationSec: meta.durationSec,
-    status: "RECEIVED",
-    ...recordingFields,
-  };
-
-  const call = meta.externalId
-    ? await prisma.call.upsert({
-        where: { deviceId_externalId: { deviceId: device.id, externalId: meta.externalId } },
-        create: { ...baseData, externalId: meta.externalId },
-        // A recording that arrives after the metadata is attached to the call.
-        update: { ...recordingFields, status: "RECEIVED" },
-      })
-    : await prisma.call.create({ data: baseData });
+  let call: { id: string; recordingPath: string | null };
+  if (existing) {
+    // Attach a recording that arrived after the call details.
+    call = await prisma.call.update({
+      where: { id: existing.id },
+      data: { ...recordingFields, status: "RECEIVED", aiError: null },
+      select: { id: true, recordingPath: true },
+    });
+  } else {
+    const data = {
+      orgId: device.orgId,
+      userId: device.userId,
+      deviceId: device.id,
+      direction: meta.direction,
+      fromNumber: meta.fromNumber,
+      toNumber: meta.toNumber,
+      contactName: meta.contactName || null,
+      startedAt,
+      durationSec: meta.durationSec,
+      status: "RECEIVED",
+      ...recordingFields,
+    };
+    call = meta.externalId
+      ? await prisma.call.upsert({
+          where: { deviceId_externalId: { deviceId: device.id, externalId: meta.externalId } },
+          create: { ...data, externalId: meta.externalId },
+          update: recordingFields ? { ...recordingFields, status: "RECEIVED" } : {},
+          select: { id: true, recordingPath: true },
+        })
+      : await prisma.call.create({ data, select: { id: true, recordingPath: true } });
+  }
 
   await touchDevice(device.id);
 
   // Transcribe + summarise after responding, so the phone isn't kept waiting.
-  after(() => processCall(call.id));
+  const callId = call.id;
+  after(() => processCall(callId));
 
-  return json({ ok: true, callId: call.id }, 202);
+  return json({ ok: true, callId, hasRecording: Boolean(call.recordingPath) }, 202);
 }
 
 async function touchDevice(id: string) {

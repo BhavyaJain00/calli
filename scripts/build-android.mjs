@@ -90,7 +90,9 @@ if (!fs.existsSync(keystoreProps)) {
 
 // 2) Build
 const gradleArgs = ["assembleRelease", "--no-daemon", "--console=plain"];
-if (process.env.APP_URL) gradleArgs.push(`-Pcalliser.serverUrl=${process.env.APP_URL.replace(/\/+$/, "")}`);
+const serverUrl = (process.env.APP_URL || "").trim().replace(/\/+$/, "");
+if (serverUrl) gradleArgs.push(`-Pcalliser.serverUrl=${serverUrl}`);
+console.log(`Server address pre-filled in the app: ${serverUrl || "(none; set APP_URL)"}`);
 const gradlew = path.join(androidDir, isWin ? "gradlew.bat" : "gradlew");
 console.log("Building the Android app…");
 if (isWin) {

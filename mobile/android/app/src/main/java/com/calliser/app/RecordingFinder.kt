@@ -28,6 +28,52 @@ object RecordingFinder {
     private const val MAX_TIME_GAP_MS = 10 * 60_000L
     private val FOLDER_HINTS = listOf("call", "phonerecord")
 
+    private val collection: Uri
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        } else {
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+        }
+
+    private val pathColumn: String
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Audio.Media.RELATIVE_PATH
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Audio.Media.DATA
+        }
+
+    private fun looksLikeCallRecording(path: String, name: String): Boolean {
+        val p = path.lowercase()
+        val n = name.lowercase()
+        return FOLDER_HINTS.any { p.contains(it) || n.contains(it) }
+    }
+
+    /** Folders of call recordings added since [sinceMs], newest first (one entry per file). */
+    fun recentCallRecordingFolders(context: Context, sinceMs: Long): List<String> {
+        if (!Permissions.granted(context, Permissions.audio)) return emptyList()
+        val projection = arrayOf(MediaStore.Audio.Media.DISPLAY_NAME, pathColumn)
+        val folders = mutableListOf<String>()
+        context.contentResolver.query(
+            collection,
+            projection,
+            "${MediaStore.Audio.Media.DATE_ADDED} >= ?",
+            arrayOf((sinceMs / 1000).toString()),
+            "${MediaStore.Audio.Media.DATE_ADDED} DESC",
+        )?.use { c ->
+            val nameCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+            val pathCol = c.getColumnIndexOrThrow(pathColumn)
+            while (c.moveToNext() && folders.size < 1000) {
+                val name = c.getString(nameCol).orEmpty()
+                val path = c.getString(pathCol).orEmpty()
+                if (looksLikeCallRecording(path, name)) {
+                    folders += if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) path else path.substringBeforeLast('/')
+                }
+            }
+        }
+        return folders
+    }
+
     fun find(context: Context, call: CallEntry): RecordingFile? {
         if (call.durationSec <= 0 || !Permissions.granted(context, Permissions.audio)) return null
 
@@ -36,17 +82,6 @@ object RecordingFinder {
         val fromSec = (startMs - 2 * 60_000) / 1000
         val toSec = (endMs + MAX_TIME_GAP_MS) / 1000
 
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
-        } else {
-            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-        }
-        val pathColumn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Audio.Media.RELATIVE_PATH
-        } else {
-            @Suppress("DEPRECATION")
-            MediaStore.Audio.Media.DATA
-        }
         val projection = arrayOf(
             MediaStore.Audio.Media._ID,
             MediaStore.Audio.Media.DISPLAY_NAME,
@@ -76,8 +111,8 @@ object RecordingFinder {
 
             while (c.moveToNext()) {
                 val name = c.getString(nameCol).orEmpty()
-                val path = c.getString(pathCol).orEmpty().lowercase()
-                val inCallFolder = FOLDER_HINTS.any { path.contains(it) || name.lowercase().contains(it) }
+                val path = c.getString(pathCol).orEmpty()
+                val inCallFolder = looksLikeCallRecording(path, name)
                 val hasNumber = numberDigits.length >= 6 && name.filter { it.isDigit() }.contains(numberDigits)
                 if (!inCallFolder && !hasNumber) continue
 
@@ -114,7 +149,15 @@ object RecordingFinder {
                 }
             }
         }
-        return best
+
+        // Use the file's real length (MediaStore's SIZE can lag behind).
+        return best?.let { file ->
+            val exact = runCatching {
+                context.contentResolver.openAssetFileDescriptor(file.uri, "r")?.use { it.length }
+            }.getOrNull() ?: -1L
+            val size = if (exact > 0) exact else file.sizeBytes
+            if (size > 0) file.copy(sizeBytes = size) else null
+        }
     }
 
     private fun normalizeMime(mime: String?, ext: String): String {
@@ -129,6 +172,7 @@ object RecordingFinder {
             "amr" -> "audio/amr"
             "3gp", "3gpp" -> "audio/3gpp"
             "webm" -> "audio/webm"
+            "flac" -> "audio/flac"
             else -> "audio/mpeg"
         }
     }

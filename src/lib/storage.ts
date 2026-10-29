@@ -22,16 +22,73 @@ const EXT_BY_MIME: Record<string, string> = {
   "audio/m4a": "m4a",
   "audio/x-m4a": "m4a",
   "audio/aac": "aac",
+  "audio/mp4a-latm": "m4a",
+  "audio/x-aac": "aac",
+  "audio/flac": "flac",
   "audio/amr": "amr",
   "audio/3gpp": "3gp",
 };
 
+// "audio/ogg; codecs=opus" -> "audio/ogg"
+export function normalizeMime(mime: string | null | undefined): string {
+  return (mime || "audio/mpeg").split(";")[0]!.trim().toLowerCase();
+}
+
 export function extensionForMime(mime: string): string {
-  return EXT_BY_MIME[mime.toLowerCase()] ?? "bin";
+  return EXT_BY_MIME[normalizeMime(mime)] ?? "bin";
 }
 
 export function isAudioMime(mime: string): boolean {
-  return mime.toLowerCase().startsWith("audio/") || mime === "video/3gpp";
+  const m = normalizeMime(mime);
+  return m.startsWith("audio/") || m === "video/3gpp";
+}
+
+// ------------------------------------------------- direct uploads from phones
+// On Supabase Storage the phone uploads the audio file straight to the bucket
+// through a short-lived signed URL. This avoids the host's request-size limit
+// (4.5 MB on Vercel), so long recordings still arrive.
+
+export function directUploadAvailable(): boolean {
+  return storageDriver() === "supabase";
+}
+
+export async function createDirectUpload(
+  folder: string,
+  mime: string
+): Promise<{ key: string; uploadUrl: string; headers: Record<string, string> }> {
+  await ensureBucket();
+  const key = `${folder}/${newKey(mime)}`;
+  const res = await supabaseRequest(`/object/upload/sign/${supabaseStorage.bucket}/${key}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`Could not create upload URL (${res.status}): ${detail.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as { url?: string };
+  if (!data.url) throw new Error("Storage did not return an upload URL");
+
+  // Headers the phone must send with its PUT request. The publishable key is
+  // public by design; the signed token in the URL is what authorises the upload.
+  const headers: Record<string, string> = {
+    "content-type": normalizeMime(mime),
+    "x-upsert": "false",
+    "cache-control": "max-age=3600",
+  };
+  const publishable = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+  if (publishable) headers.apikey = publishable;
+
+  return { key, uploadUrl: `${supabaseStorage.url}/storage/v1${data.url}`, headers };
+}
+
+// Size in bytes of a directly uploaded file (0 if unknown), or null if missing.
+export async function directUploadSize(key: string): Promise<number | null> {
+  const res = await supabaseRequest(`/object/${supabaseStorage.bucket}/${key}`, { method: "HEAD" });
+  if (!res.ok) return null;
+  const size = Number(res.headers.get("content-length"));
+  return Number.isFinite(size) && size > 0 ? size : 0;
 }
 
 function parseRef(ref: string): { driver: "supabase" | "local"; key: string } {
