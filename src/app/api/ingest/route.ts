@@ -97,8 +97,16 @@ export async function POST(req: Request) {
 
   let recordingFields = {};
   if (recording) {
+    let recordingPath: string;
+    try {
+      recordingPath = await saveRecording(recording.buffer, recording.mime);
+    } catch (err) {
+      console.error("[ingest] could not store recording:", err);
+      // 503 tells the phone to retry later instead of dropping the recording.
+      return apiError(err instanceof Error ? err.message : "Recording storage failed", 503);
+    }
     recordingFields = {
-      recordingPath: await saveRecording(recording.buffer, recording.mime),
+      recordingPath,
       recordingMime: recording.mime,
       recordingSize: recording.buffer.length,
     };

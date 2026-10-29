@@ -57,6 +57,12 @@ export async function saveRecording(buffer: Buffer, mime: string): Promise<strin
     await supabaseUpload(key, buffer, mime);
     return `supabase:${key}`;
   }
+  if (process.env.VERCEL) {
+    // Vercel functions have a read-only, non-persistent disk.
+    throw new Error(
+      "Recording storage is not configured: set SUPABASE_SECRET_KEY on Vercel to store recordings in Supabase Storage"
+    );
+  }
   const abs = localPath(key);
   if (!abs) throw new Error("Invalid recording path");
   await fsp.mkdir(path.dirname(/*turbopackIgnore: true*/ abs), { recursive: true });

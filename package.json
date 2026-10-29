@@ -2,6 +2,7 @@
   "name": "calliser",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@10.11.1",
   "scripts": {
     "dev": "next dev",
     "build": "prisma generate && next build",
@@ -31,5 +32,13 @@
     "tailwindcss": "4.3.3",
     "tsx": "4.23.15",
     "typescript": "7.0.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "esbuild",
+      "prisma"
+    ]
   }
 }
